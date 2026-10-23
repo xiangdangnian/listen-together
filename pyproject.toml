@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "listen-together"
+version = "1.0.0"
+description = "A small synchronized local-music listening room for Radmin VPN."
+requires-python = ">=3.12"
+dependencies = [
+    "mutagen>=1.47.0",
+    "psutil>=6.0.0",
+    "python-vlc>=3.0.21203",
+    "PySide6-Essentials==6.8.3",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.10.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

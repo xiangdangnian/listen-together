@@ -1,0 +1,2 @@
+"""Session-scoped media cache."""
+
