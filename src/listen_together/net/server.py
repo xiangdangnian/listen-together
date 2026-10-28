@@ -4,11 +4,13 @@ import socket
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from listen_together.net.protocol import (
+    PROTOCOL_VERSION,
     auth_response,
     receive_file,
     receive_json,
@@ -27,16 +29,66 @@ MediaCallback = Callable[[str, str, Path], None]
 
 
 class _Peer:
+    MAX_PENDING = 256
+
     def __init__(self, member_id: str, sock: socket.socket) -> None:
         self.member_id = member_id
         self.sock = sock
-        self.send_lock = threading.Lock()
+        self._condition = threading.Condition()
+        self._outgoing: deque[dict[str, Any]] = deque()
+        self._closed = False
+        self._writer = threading.Thread(
+            target=self._writer_loop,
+            name=f"listen-together-send-{member_id}",
+            daemon=True,
+        )
+        self._writer.start()
 
     def send(self, payload: dict[str, Any]) -> None:
-        with self.send_lock:
-            send_json(self.sock, payload)
+        overflow = False
+        with self._condition:
+            if self._closed:
+                raise ConnectionError("Peer connection is closed.")
+            message_type = str(payload.get("type", ""))
+            if message_type in {"snapshot", "room_state"}:
+                for index, queued in enumerate(self._outgoing):
+                    if str(queued.get("type", "")) == message_type:
+                        self._outgoing[index] = payload
+                        self._condition.notify()
+                        return
+            if len(self._outgoing) >= self.MAX_PENDING:
+                overflow = True
+            else:
+                self._outgoing.append(payload)
+                self._condition.notify()
+        if overflow:
+            self.close()
+            raise ConnectionError("Peer send queue is full.")
 
     def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._outgoing.clear()
+            self._condition.notify_all()
+        self._close_socket()
+
+    def _writer_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._outgoing and not self._closed:
+                    self._condition.wait()
+                if self._closed and not self._outgoing:
+                    return
+                payload = self._outgoing.popleft()
+            try:
+                send_json(self.sock, payload)
+            except Exception:
+                self.close()
+                return
+
+    def _close_socket(self) -> None:
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
@@ -124,7 +176,7 @@ class HostServer:
         try:
             peer.send(payload)
             return True
-        except OSError:
+        except Exception:
             self._remove_peer(member_id)
             return False
 
@@ -136,7 +188,7 @@ class HostServer:
                 continue
             try:
                 peer.send(payload)
-            except OSError:
+            except Exception:
                 self._remove_peer(member_id)
 
     def expect_upload(self, member_id: str, track_id: str, size_bytes: int) -> None:
@@ -185,6 +237,12 @@ class HostServer:
             if kind != "control":
                 send_json(client_sock, {"type": "error", "message": "Unknown connection type."})
                 return
+            if int(first.get("version", 0)) != PROTOCOL_VERSION:
+                send_json(
+                    client_sock,
+                    {"type": "error", "message": "版本不一致，请所有成员更新到同一版本。"},
+                )
+                return
 
             nonce = secrets.token_urlsafe(24)
             send_json(
@@ -229,9 +287,6 @@ class HostServer:
                 member_id = connected_result
 
             token = uuid.uuid4().hex
-            with self._lock:
-                self._peers[member_id] = _Peer(member_id, client_sock)
-                self._tokens[token] = member_id
             send_json(
                 client_sock,
                 {
@@ -241,6 +296,10 @@ class HostServer:
                     "host_monotonic_us": time.monotonic_ns() // 1_000,
                 },
             )
+            peer = _Peer(member_id, client_sock)
+            with self._lock:
+                self._peers[member_id] = peer
+                self._tokens[token] = member_id
             if initial_message is not None:
                 self.send_to(member_id, initial_message)
 
@@ -297,7 +356,7 @@ class HostServer:
                 send_json(client_sock, {"type": "error", "message": "未请求该文件。"})
                 return
             try:
-                self._cache.ensure_capacity(expected_size)
+                self._cache.reserve(track_id, expected_size)
             except Exception as error:
                 send_json(client_sock, {"type": "error", "message": str(error)})
                 return
@@ -319,6 +378,8 @@ class HostServer:
             except Exception as error:
                 part.unlink(missing_ok=True)
                 send_json(client_sock, {"type": "error", "message": str(error)})
+            finally:
+                self._cache.release_reservation(track_id)
             return
 
         send_json(client_sock, {"type": "error", "message": "未知传输类型。"})
@@ -344,4 +405,3 @@ class HostServer:
         if peer is not None:
             peer.close()
         return True
-

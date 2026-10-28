@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, QStandardPaths, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
 
@@ -39,6 +40,9 @@ def main() -> int:
     QApplication.setApplicationName("ListenTogether")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
+    icon_path = _resource_path("listen_together/assets/app-icon.png")
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     if "--smoke-test" in sys.argv:
         return _run_smoke_test(app)
@@ -70,6 +74,12 @@ def main() -> int:
     instance_server.newConnection.connect(activate_existing)
     window.show()
     return app.exec()
+
+
+def _resource_path(relative_path: str) -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / relative_path
+    return Path(__file__).resolve().parent.parent.parent / "src" / relative_path
 
 
 def _run_audio_self_test() -> int:

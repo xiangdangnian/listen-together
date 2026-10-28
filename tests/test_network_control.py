@@ -1,12 +1,15 @@
+import socket
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from listen_together.library.scanner import compute_sha256
+from listen_together.net import server as server_module
 from listen_together.net.client import HostClient
-from listen_together.net.server import HostServer
+from listen_together.net.server import HostServer, _Peer
 from listen_together.transfer.session_cache import SessionCache
 
 
@@ -87,6 +90,32 @@ class NetworkControlTests(unittest.TestCase):
             [message for message in self.received if message.get("type") == "snapshot"],
         )
 
+    def test_peer_send_queue_does_not_block_caller(self) -> None:
+        left, right = socket.socketpair()
+        self.addCleanup(right.close)
+        blocked = threading.Event()
+        release = threading.Event()
+        original_send_json = server_module.send_json
+
+        def slow_send(sock, payload) -> None:
+            if not blocked.is_set():
+                blocked.set()
+                release.wait(2)
+            original_send_json(sock, payload)
+
+        with patch("listen_together.net.server.send_json", side_effect=slow_send):
+            peer = _Peer("stuck", left)
+            self.addCleanup(peer.close)
+            peer.send({"type": "event", "message": "first"})
+            self.assertTrue(blocked.wait(1))
+            self.assertFalse(release.wait(0.05))
+            started = time.monotonic()
+            for index in range(20):
+                peer.send({"type": "event", "message": f"{index}"})
+            elapsed = time.monotonic() - started
+            release.set()
+
+        self.assertLess(elapsed, 0.2)
     def test_wrong_room_passphrase_is_rejected(self) -> None:
         bad_client = HostClient(
             host="127.0.0.1",

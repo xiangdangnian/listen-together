@@ -30,6 +30,8 @@ class QueueTrack:
     artist: str
     duration_ms: int
     size_bytes: int
+    lyrics: str = ""
+    lyrics_lrc: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,6 +49,7 @@ class QueueTrack:
 @dataclass(slots=True)
 class Playback:
     epoch: int = 0
+    run_id: int = 0
     track_id: str | None = None
     duration_ms: int = 0
     playing: bool = False
@@ -57,6 +60,7 @@ class Playback:
     def to_dict(self) -> dict[str, Any]:
         return {
             "epoch": self.epoch,
+            "run_id": self.run_id,
             "track_id": self.track_id,
             "duration_ms": self.duration_ms,
             "playing": self.playing,
@@ -64,4 +68,3 @@ class Playback:
             "anchor_host_us": self.anchor_host_us,
             "rate": self.rate,
         }
-

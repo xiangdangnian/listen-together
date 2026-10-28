@@ -18,7 +18,11 @@ class LibraryService:
 
     def scan_directory(self, directory: Path) -> list[MediaFile]:
         root = Path(directory).resolve()
+        with self._lock:
+            self._tracks.clear()
+        self._cache.remove_tracks_outside(root)
         scanned: list[MediaFile] = []
+        pending_upserts: list[tuple[MediaFile, int]] = []
         for path in iter_audio_paths(root):
             try:
                 stat = path.stat()
@@ -27,14 +31,22 @@ class LibraryService:
                     mtime_ns=stat.st_mtime_ns,
                     size_bytes=stat.st_size,
                 )
-                if media is None or media.duration_ms <= 100:
+                if (
+                    media is None
+                    or media.duration_ms <= 100
+                    or (media.lyrics and not media.lyrics_lrc)
+                ):
                     media = read_media_file(path)
-                    self._cache.upsert(media, mtime_ns=stat.st_mtime_ns)
+                    pending_upserts.append((media, stat.st_mtime_ns))
+                    if len(pending_upserts) >= 50:
+                        self._cache.upsert_many(pending_upserts)
+                        pending_upserts.clear()
                 with self._lock:
                     self._tracks[media.path] = media
                 scanned.append(media)
             except (OSError, ValueError):
                 continue
+        self._cache.upsert_many(pending_upserts)
         return scanned
 
     def tracks(self) -> list[MediaFile]:
@@ -77,6 +89,8 @@ class LibraryService:
                     duration_ms=media.duration_ms,
                     size_bytes=media.size_bytes,
                     track_id=track_id,
+                    lyrics=media.lyrics,
+                    lyrics_lrc=media.lyrics_lrc,
                 )
                 self._tracks[resolved_path] = updated
                 cached_path = updated.path

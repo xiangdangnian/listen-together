@@ -6,7 +6,8 @@ import struct
 from typing import Any
 
 
-MAX_JSON_FRAME = 64 * 1024
+PROTOCOL_VERSION = 3
+MAX_JSON_FRAME = 2 * 1024 * 1024
 
 
 def auth_response(passphrase: str, nonce: str) -> str:

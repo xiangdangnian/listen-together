@@ -1,14 +1,20 @@
 import secrets
 
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QSpinBox,
+    QSlider,
     QVBoxLayout,
 )
+
+from listen_together.ui.theme import APPEARANCE_PRESETS
 
 
 class CreateRoomDialog(QDialog):
@@ -123,3 +129,55 @@ class JoinRoomDialog(QDialog):
             "display_name": self.display_name.text().strip(),
         }
 
+
+class AppearanceDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        preset_id: str,
+        opacity_percent: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("界面外观")
+        self.setMinimumWidth(380)
+        self.preset_box = QComboBox()
+        for preset in APPEARANCE_PRESETS:
+            self.preset_box.addItem(preset["label"], preset["id"])
+        index = self.preset_box.findData(preset_id)
+        if index >= 0:
+            self.preset_box.setCurrentIndex(index)
+
+        self.opacity_slider = QSlider()
+        self.opacity_slider.setRange(60, 100)
+        self.opacity_slider.setValue(min(max(60, opacity_percent), 100))
+        self.opacity_value = QLabel(f"{self.opacity_slider.value()}%")
+        self.opacity_slider.valueChanged.connect(
+            lambda value: self.opacity_value.setText(f"{value}%")
+        )
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_value)
+
+        form = QFormLayout()
+        form.setSpacing(12)
+        form.addRow("外观预设", self.preset_box)
+        form.addRow("窗口透明度", opacity_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 20)
+        layout.setSpacing(18)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def values(self) -> tuple[str, int]:
+        return str(self.preset_box.currentData()), self.opacity_slider.value()

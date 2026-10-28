@@ -6,6 +6,8 @@ $distDir = Join-Path $projectRoot "dist"
 $appDir = Join-Path $distDir "ListenTogether"
 $vlcSource = "C:\Program Files\VideoLAN\VLC"
 $vlcTarget = Join-Path $appDir "vlc"
+$iconPath = Join-Path $projectRoot "src\listen_together\assets\app-icon.ico"
+$iconData = Join-Path $projectRoot "src\listen_together\assets"
 $projectResolved = [System.IO.Path]::GetFullPath($projectRoot)
 
 function Assert-ProjectPath([string]$target) {
@@ -35,8 +37,10 @@ if (Test-Path -LiteralPath $appDir) {
     --clean `
     --windowed `
     --name ListenTogether `
+    --icon $iconPath `
     --paths (Join-Path $projectRoot "src") `
     --hidden-import vlc `
+    --add-data "$iconData;listen_together\assets" `
     (Join-Path $projectRoot "run_app.py")
 
 if (-not (Test-Path -LiteralPath $appDir)) {

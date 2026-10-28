@@ -1,10 +1,18 @@
 import hashlib
+import re
 from pathlib import Path
 
 import mutagen
 
 from listen_together.library.models import MediaFile
 from listen_together.player.vlc_backend import probe_media_duration
+
+
+_LRC_TIMESTAMP = re.compile(r"^\s*\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]\s*")
+_LRC_METADATA = re.compile(
+    r"^\s*\[(?:ar|ti|al|by|offset|re|ve|length):.*\]\s*$",
+    re.IGNORECASE,
+)
 
 
 SUPPORTED_EXTENSIONS = {
@@ -47,6 +55,7 @@ def read_media_file(path: Path) -> MediaFile:
             duration_ms = probe_media_duration(resolved_path)
         except Exception:
             duration_ms = max(1, duration_ms)
+    lyrics, lyrics_lrc = _read_lyrics(resolved_path, tags)
     return MediaFile(
         path=resolved_path,
         title=title.strip(),
@@ -54,6 +63,8 @@ def read_media_file(path: Path) -> MediaFile:
         album=album.strip(),
         duration_ms=duration_ms,
         size_bytes=resolved_path.stat().st_size,
+        lyrics=lyrics,
+        lyrics_lrc=lyrics_lrc,
     )
 
 
@@ -77,4 +88,67 @@ def _tag_value(tags, keys: tuple[str, ...]) -> str:
             value = value[0] if value else ""
         return str(value)
     return ""
+
+
+def _read_lyrics(path: Path, tags) -> tuple[str, str]:
+    sidecar = path.with_suffix(".lrc")
+    if sidecar.is_file():
+        raw = sidecar.read_bytes()
+        for encoding in ("utf-8-sig", "gb18030", "utf-16"):
+            try:
+                decoded = raw.decode(encoding)
+                return _clean_lyrics(decoded), decoded[:20_000]
+            except UnicodeDecodeError:
+                continue
+
+    candidates: list[str] = []
+    for key in ("lyrics", "unsyncedlyrics", "LYRICS", "UNSYNCEDLYRICS", "\xa9lyr"):
+        try:
+            value = tags.get(key)
+        except (AttributeError, KeyError):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            candidates.extend(_lyric_text(item) for item in value if item)
+        else:
+            candidates.append(_lyric_text(value))
+
+    try:
+        for frame in tags.getall("USLT"):
+            candidates.append(str(frame.text))
+    except (AttributeError, KeyError):
+        pass
+
+    for value in candidates:
+        raw_lyrics = _lyric_text(value)
+        lyrics = _clean_lyrics(raw_lyrics)
+        if lyrics:
+            return lyrics, raw_lyrics[:20_000]
+    return "", ""
+
+
+def _lyric_text(value) -> str:
+    if isinstance(value, bytes):
+        for encoding in ("utf-8", "gb18030", "utf-16"):
+            try:
+                return value.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _clean_lyrics(value: str) -> str:
+    lines: list[str] = []
+    for raw_line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _LRC_METADATA.match(raw_line):
+            continue
+        line = raw_line
+        while _LRC_TIMESTAMP.match(line):
+            line = _LRC_TIMESTAMP.sub("", line, count=1)
+        lines.append(line.strip())
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned[:10_000]
 

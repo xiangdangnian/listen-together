@@ -11,6 +11,8 @@ class MediaFile:
     duration_ms: int
     size_bytes: int
     track_id: str | None = None
+    lyrics: str = ""
+    lyrics_lrc: str = ""
 
     @property
     def display_name(self) -> str:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "listen-together"
-version = "1.0.0"
+version = "1.1.1"
 description = "A small synchronized local-music listening room for Radmin VPN."
 requires-python = ">=3.12"
 dependencies = [
@@ -22,3 +22,5 @@ build = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+listen_together = ["assets/*"]

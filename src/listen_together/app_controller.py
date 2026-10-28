@@ -18,12 +18,14 @@ from listen_together.player.base import PlayerBackend
 from listen_together.player.controller import PlaybackController
 from listen_together.player.vlc_backend import VLCBackend
 from listen_together.sync.clock import ClockSynchronizer
+from listen_together.sync.drift import DriftCorrector
 from listen_together.sync.timeline import PlaybackAnchor, Timeline
 from listen_together.transfer.session_cache import CacheFullError, SessionCache
 
 
 EventCallback = Callable[[str, Any], None]
 BackendFactory = Callable[[], PlayerBackend]
+QUEUE_BATCH_SIZE = 50
 
 
 class AppController:
@@ -55,8 +57,10 @@ class AppController:
         self.port = 43871
         self.host_address = ""
         self.snapshot: dict[str, Any] = {}
+        self._snapshot_received_at = time.monotonic()
         self.connection_status = "本地"
         self._timeline = Timeline()
+        self._drift_corrector = DriftCorrector()
         self._snapshot_dirty = True
         self._last_snapshot_signature = ""
         self._last_broadcast_at = 0.0
@@ -65,7 +69,7 @@ class AppController:
         self._pending_uploads: set[str] = set()
         self._hashing_paths: set[Path] = set()
         self._loaded_track_id: str | None = None
-        self._drift_hits = 0
+        self._loaded_run_id: int | None = None
         self._pending_host_requests: set[str] = set()
         self._start_local_session(self.display_name)
 
@@ -213,38 +217,59 @@ class AppController:
 
     def tick(self) -> None:
         self._drain_events()
+        self._update_cache_pins()
         if self.role in {"local", "host"}:
             self._ensure_player()
             if self.room is not None:
                 self.room.tick()
-            self._prepare_host_media()
+            self._prepare_host_media(include_prefetch=False)
             self._sync_playback()
             self._refresh_snapshot()
+            if self._can_prefetch_full_next():
+                self._prepare_host_media(include_prefetch=True)
         else:
-            self._prepare_client_media()
+            self._prepare_client_media(include_prefetch=False)
             self._sync_playback()
             self._maybe_send_clock_ping()
+            if self._can_prefetch_full_next():
+                self._prepare_client_media(include_prefetch=True)
         self._prune_cache()
         self._drain_events()
 
     def add_track(self, media: MediaFile) -> None:
-        path = media.path.resolve()
+        self.add_tracks([media])
+
+    def add_tracks(self, media_files: list[MediaFile]) -> None:
+        pending: list[MediaFile] = []
         with self._lock:
-            if path in self._hashing_paths:
-                return
-            self._hashing_paths.add(path)
+            for media in media_files:
+                path = media.path.resolve()
+                if path in self._hashing_paths:
+                    continue
+                self._hashing_paths.add(path)
+                pending.append(media)
+        if not pending:
+            return
 
         def run() -> None:
-            try:
-                track_id = self.library.compute_track_id(path)
-                self._event_queue.put(("track_hashed", (media, track_id)))
-            except Exception as error:
-                self._event_queue.put(("error", f"计算文件指纹失败：{error}"))
-            finally:
-                with self._lock:
-                    self._hashing_paths.discard(path)
+            batch: list[tuple[MediaFile, str]] = []
+            for media in pending:
+                path = media.path.resolve()
+                try:
+                    track_id = self.library.compute_track_id(path)
+                    batch.append((media, track_id))
+                    if len(batch) >= QUEUE_BATCH_SIZE:
+                        self._event_queue.put(("tracks_hashed", list(batch)))
+                        batch.clear()
+                except Exception as error:
+                    self._event_queue.put(("error", f"计算文件指纹失败：{error}"))
+                finally:
+                    with self._lock:
+                        self._hashing_paths.discard(path)
+            if batch:
+                self._event_queue.put(("tracks_hashed", batch))
 
-        threading.Thread(target=run, name="track-hash", daemon=True).start()
+        threading.Thread(target=run, name="track-hash-batch", daemon=True).start()
 
     def play_pause(self) -> None:
         if self.role in {"local", "host"}:
@@ -258,6 +283,7 @@ class AppController:
             self._refresh_snapshot(force=True)
         elif self.role == "client" and self.client is not None:
             self._client_send({"type": "play_pause"})
+        self._drift_corrector.reset()
 
     def seek(self, position_ms: int) -> None:
         if self.role in {"local", "host"}:
@@ -267,6 +293,7 @@ class AppController:
                 self._refresh_snapshot(force=True)
         elif self.role == "client" and self.client is not None:
             self._client_send({"type": "seek", "position_ms": int(position_ms)})
+        self._drift_corrector.reset()
 
     def next_track(self) -> None:
         if self.role in {"local", "host"}:
@@ -276,6 +303,7 @@ class AppController:
                 self._refresh_snapshot(force=True)
         elif self.role == "client" and self.client is not None:
             self._client_send({"type": "next"})
+        self._drift_corrector.reset()
 
     def previous_track(self) -> None:
         if self.role in {"local", "host"}:
@@ -285,20 +313,49 @@ class AppController:
                 self._refresh_snapshot(force=True)
         elif self.role == "client" and self.client is not None:
             self._client_send({"type": "previous"})
+        self._drift_corrector.reset()
 
     def set_volume(self, volume: int) -> None:
         self._ensure_player()
         if self.player is not None:
             self.player.set_volume(volume)
 
-    def remove_queue_item(self, queue_id: str) -> None:
+    def cycle_playback_mode(self) -> str:
+        modes = ["sequential", "loop", "shuffle"]
+        current = str(self.snapshot.get("playback_mode", "sequential"))
+        mode = modes[(modes.index(current) + 1) % len(modes)] if current in modes else "sequential"
         if self.role in {"local", "host"}:
             if self.room is not None:
-                self.room.remove_track(queue_id, actor_id=self.member_id)
+                self.room.set_playback_mode(mode)
                 self._snapshot_dirty = True
                 self._refresh_snapshot(force=True)
         elif self.role == "client" and self.client is not None:
-            self._client_send({"type": "queue_remove", "queue_id": queue_id})
+            self._client_send({"type": "set_playback_mode", "mode": mode})
+        return mode
+
+    def remove_queue_item(self, queue_id: str) -> None:
+        self.remove_queue_items([queue_id])
+
+    def remove_queue_items(self, queue_ids: list[str]) -> None:
+        queue_ids = [str(queue_id) for queue_id in queue_ids if queue_id]
+        if not queue_ids:
+            return
+        if self.role in {"local", "host"}:
+            if self.room is not None:
+                removed, denied = self.room.remove_tracks(
+                    queue_ids,
+                    actor_id=self.member_id,
+                )
+                if removed:
+                    self._snapshot_dirty = True
+                    self._refresh_snapshot(force=True)
+                    self._emit("event", f"已从共享歌单删除 {len(removed)} 首歌曲")
+                if denied:
+                    self._emit("error", f"有 {len(denied)} 首歌曲无权删除。")
+        elif self.role == "client" and self.client is not None:
+            self._client_send(
+                {"type": "queue_remove_batch", "queue_ids": queue_ids}
+            )
 
     def move_queue_item(self, queue_id: str, before_queue_id: str | None) -> None:
         if self.role in {"local", "host"}:
@@ -385,6 +442,7 @@ class AppController:
         self.clock = None
         self._snapshot_dirty = True
         self._loaded_track_id = None
+        self._loaded_run_id = None
         self._refresh_snapshot(force=True)
 
     def _stop_current_session(self) -> None:
@@ -410,6 +468,7 @@ class AppController:
         self._pending_uploads.clear()
         self._pending_host_requests.clear()
         self._loaded_track_id = None
+        self._loaded_run_id = None
         self.snapshot = {}
         self._snapshot_dirty = True
 
@@ -500,29 +559,21 @@ class AppController:
             return
 
         if message_type == "queue_add":
-            track_id = str(message.get("track_id", ""))
-            title = str(message.get("title", "")).strip()
-            artist = str(message.get("artist", "")).strip()
-            duration_ms = int(message.get("duration_ms", 0))
-            size_bytes = int(message.get("size_bytes", 0))
-            if (
-                not track_id.startswith("sha256:")
-                or not title
-                or duration_ms <= 0
-                or size_bytes <= 0
-                or size_bytes > 500 * 1024 * 1024
-            ):
-                self._emit("error", "歌曲信息无效，无法加入歌单。")
+            if self._accept_queue_add(member_id, message):
+                self._snapshot_dirty = True
+            return
+
+        if message_type == "queue_add_batch":
+            items = message.get("items")
+            if not isinstance(items, list):
+                self._emit("error", "批量歌曲信息无效。")
                 return
-            self.room.add_track(
-                member_id=member_id,
-                track_id=track_id,
-                title=title,
-                artist=artist,
-                duration_ms=duration_ms,
-                size_bytes=size_bytes,
-            )
-            self._snapshot_dirty = True
+            added = False
+            for item in items[:QUEUE_BATCH_SIZE]:
+                if isinstance(item, dict):
+                    added = self._accept_queue_add(member_id, item) or added
+            if added:
+                self._snapshot_dirty = True
             return
 
         if message_type == "queue_remove":
@@ -531,6 +582,27 @@ class AppController:
                 actor_id=member_id,
             )
             self._snapshot_dirty = True
+            return
+
+        if message_type == "queue_remove_batch":
+            queue_ids = message.get("queue_ids")
+            if not isinstance(queue_ids, list):
+                self._emit("error", "批量删除信息无效。")
+                return
+            removed, denied = self.room.remove_tracks(
+                [str(queue_id) for queue_id in queue_ids],
+                actor_id=member_id,
+            )
+            if removed:
+                self._snapshot_dirty = True
+            self.server.send_to(
+                member_id,
+                {
+                    "type": "queue_action_result",
+                    "removed": len(removed),
+                    "denied": len(denied),
+                },
+            )
             return
 
         if message_type == "queue_move":
@@ -544,6 +616,11 @@ class AppController:
 
         if message_type == "queue_play":
             self.room.play_queue_item(str(message.get("queue_id", "")))
+            self._snapshot_dirty = True
+            return
+
+        if message_type == "set_playback_mode":
+            self.room.set_playback_mode(str(message.get("mode", "")))
             self._snapshot_dirty = True
             return
 
@@ -576,12 +653,53 @@ class AppController:
                 {"type": "snapshot", "snapshot": self._compose_snapshot()},
             )
 
+    def _accept_queue_add(
+        self,
+        member_id: str,
+        message: dict[str, Any],
+    ) -> bool:
+        if self.room is None or self.server is None:
+            return False
+        track_id = str(message.get("track_id", ""))
+        title = str(message.get("title", "")).strip()
+        artist = str(message.get("artist", "")).strip()
+        duration_ms = int(message.get("duration_ms", 0))
+        size_bytes = int(message.get("size_bytes", 0))
+        lyrics = str(message.get("lyrics", ""))[:8_000]
+        lyrics_lrc = str(message.get("lyrics_lrc", ""))[:8_000]
+        if (
+            not track_id.startswith("sha256:")
+            or not title
+            or duration_ms <= 0
+            or size_bytes <= 0
+            or size_bytes > 500 * 1024 * 1024
+        ):
+            self._emit("error", "歌曲信息无效，无法加入歌单。")
+            return False
+        if self.room.has_track(track_id):
+            self.server.send_to(
+                member_id,
+                {"type": "event", "message": f"歌单中已有《{title}》"},
+            )
+            return False
+        self.room.add_track(
+            member_id=member_id,
+            track_id=track_id,
+            title=title,
+            artist=artist,
+            duration_ms=duration_ms,
+            size_bytes=size_bytes,
+            lyrics=lyrics,
+            lyrics_lrc=lyrics_lrc,
+        )
+        return True
     def _handle_client_message(self, message: dict[str, Any]) -> None:
         message_type = str(message.get("type", ""))
         if message_type == "snapshot":
             snapshot = message.get("snapshot")
             if isinstance(snapshot, dict):
                 self.snapshot = snapshot
+                self._snapshot_received_at = time.monotonic()
                 self.connection_status = "已同步"
                 self._emit("snapshot", snapshot)
             return
@@ -609,6 +727,18 @@ class AppController:
                     name="upload-track",
                     daemon=True,
                 ).start()
+            return
+
+        if message_type == "queue_action_result":
+            removed = int(message.get("removed", 0))
+            denied = int(message.get("denied", 0))
+            if removed:
+                self._emit("event", f"已从共享歌单删除 {removed} 首歌曲")
+            if denied:
+                self._emit("error", f"有 {denied} 首歌曲无权删除。")
+            return
+
+        if message_type == "heartbeat":
             return
 
         if message_type == "time_pong":
@@ -642,7 +772,9 @@ class AppController:
             self._emit("library_updated", self.library.tracks())
         elif kind == "track_hashed":
             media, track_id = payload
-            self._add_track_with_id(media, track_id)
+            self._add_tracks_with_ids([(media, track_id)])
+        elif kind == "tracks_hashed":
+            self._add_tracks_with_ids(payload)
         elif kind == "host_message":
             self._handle_host_message(*payload)
         elif kind == "host_media_received":
@@ -689,32 +821,69 @@ class AppController:
             self._emit("error", payload)
 
     def _add_track_with_id(self, media: MediaFile, track_id: str) -> None:
+        self._add_tracks_with_ids([(media, track_id)])
+
+    def _add_tracks_with_ids(
+        self,
+        pairs: list[tuple[MediaFile, str]],
+    ) -> None:
+        if not pairs:
+            return
         if self.role == "client":
-            self._client_send(
-                {
-                    "type": "queue_add",
-                    "track_id": track_id,
-                    "title": media.title,
-                    "artist": media.artist,
-                    "duration_ms": media.duration_ms,
-                    "size_bytes": media.size_bytes,
-                }
-            )
+            queued_ids = {
+                str(item.get("track_id", ""))
+                for item in self.snapshot.get("queue", [])
+            }
+            pending: list[dict[str, Any]] = []
+            for media, track_id in pairs:
+                if track_id in queued_ids:
+                    self._emit("event", f"歌单中已有《{media.title}》")
+                    continue
+                queued_ids.add(track_id)
+                pending.append(self._media_queue_payload(media, track_id))
+            for offset in range(0, len(pending), QUEUE_BATCH_SIZE):
+                self._client_send(
+                    {
+                        "type": "queue_add_batch",
+                        "items": pending[offset : offset + QUEUE_BATCH_SIZE],
+                    }
+                )
             return
         if self.room is None:
             return
-        self.room.add_track(
-            member_id=self.member_id,
-            track_id=track_id,
-            title=media.title,
-            artist=media.artist,
-            duration_ms=media.duration_ms,
-            size_bytes=media.size_bytes,
-        )
-        self._snapshot_dirty = True
-        self._refresh_snapshot(force=True)
+        added = False
+        for media, track_id in pairs:
+            if self.room.has_track(track_id):
+                self._emit("event", f"歌单中已有《{media.title}》")
+                continue
+            self.room.add_track(
+                member_id=self.member_id,
+                track_id=track_id,
+                title=media.title,
+                artist=media.artist,
+                duration_ms=media.duration_ms,
+                size_bytes=media.size_bytes,
+                lyrics=media.lyrics[:8_000],
+                lyrics_lrc=media.lyrics_lrc[:8_000],
+            )
+            added = True
+        if added:
+            self._snapshot_dirty = True
+            self._refresh_snapshot(force=True)
 
-    def _prepare_host_media(self) -> None:
+    @staticmethod
+    def _media_queue_payload(media: MediaFile, track_id: str) -> dict[str, Any]:
+        return {
+            "track_id": track_id,
+            "title": media.title,
+            "artist": media.artist,
+            "duration_ms": media.duration_ms,
+            "size_bytes": media.size_bytes,
+            "lyrics": media.lyrics[:8_000],
+            "lyrics_lrc": media.lyrics_lrc[:8_000],
+        }
+
+    def _prepare_host_media(self, *, include_prefetch: bool) -> None:
         if self.room is None:
             return
         current = self.room.current_track
@@ -739,6 +908,8 @@ class AppController:
                     {"type": "transfer_request", "track_id": current.track_id},
                 )
         if (
+            include_prefetch
+            and
             next_track is not None
             and self._resolve_host_media(next_track.track_id) is None
             and next_track.source_member_id != self.member_id
@@ -756,14 +927,14 @@ class AppController:
                 {"type": "transfer_request", "track_id": next_track.track_id},
             )
 
-    def _prepare_client_media(self) -> None:
+    def _prepare_client_media(self, *, include_prefetch: bool) -> None:
         if self.client is None or self.cache is None:
             return
         current = self._current_track()
         if current is not None:
             self._prepare_client_track(current, mark_ready=True)
         prefetch_id = self.snapshot.get("prefetch_track_id")
-        if prefetch_id:
+        if include_prefetch and prefetch_id:
             prefetch = next(
                 (
                     item
@@ -774,6 +945,16 @@ class AppController:
             )
             if prefetch is not None:
                 self._prepare_client_track(prefetch, mark_ready=False)
+
+    def _can_prefetch_full_next(self) -> bool:
+        current = self._current_track()
+        if current is None:
+            return False
+        track_id = str(current.get("track_id", ""))
+        return bool(
+            self.player is not None
+            and self._loaded_track_id == track_id
+        )
 
     def _prepare_client_track(
         self,
@@ -817,7 +998,7 @@ class AppController:
         assert self.client is not None
         part = self.cache.part_path(track_id)
         try:
-            self.cache.ensure_capacity(size_bytes)
+            self.cache.reserve(track_id, size_bytes)
             self.client.download_track(
                 track_id=track_id,
                 part_path=part,
@@ -833,6 +1014,8 @@ class AppController:
         except (CacheFullError, OSError, RuntimeError, ValueError) as error:
             part.unlink(missing_ok=True)
             self._event_queue.put(("download_failed", (track_id, str(error))))
+        finally:
+            self.cache.release_reservation(track_id)
 
     def _upload_worker(self, track_id: str, path: Path) -> None:
         try:
@@ -846,18 +1029,24 @@ class AppController:
     def _sync_playback(self) -> None:
         playback = self.snapshot.get("playback")
         if not isinstance(playback, dict) or not playback.get("track_id"):
+            self._stop_loaded_media()
             return
         track_id = str(playback["track_id"])
+        run_id = int(playback.get("run_id", 0))
         path = self.current_media_path()
         if path is None:
+            if self._loaded_track_id != track_id:
+                self._stop_loaded_media()
             return
         self._ensure_player()
         if self.player is None:
             return
-        if self._loaded_track_id != track_id:
+        if self._loaded_track_id != track_id or self._loaded_run_id != run_id:
+            self._stop_loaded_media()
             try:
                 self.player.load(path)
                 self._loaded_track_id = track_id
+                self._loaded_run_id = run_id
                 self._drift_hits = 0
             except Exception as error:
                 self._emit("error", f"播放器加载失败：{error}")
@@ -904,17 +1093,22 @@ class AppController:
         if self.player.state.value != "playing":
             self.player.seek_ms(target_ms)
             self.player.play()
-            self._drift_hits = 0
+            self._drift_corrector.reset()
             return
 
         drift_ms = self.player.position_ms() - target_ms
-        if abs(drift_ms) > 120:
-            self._drift_hits += 1
-            if self._drift_hits >= 2:
-                self.player.seek_ms(target_ms)
-                self._drift_hits = 0
-        else:
-            self._drift_hits = 0
+        if self._drift_corrector.update(drift_ms, now_s=time.monotonic()):
+            self.player.seek_ms(target_ms)
+
+    def _stop_loaded_media(self) -> None:
+        if self.player is not None and self._loaded_track_id is not None:
+            try:
+                self.player.stop()
+            except Exception:
+                pass
+        self._loaded_track_id = None
+        self._loaded_run_id = None
+        self._drift_corrector.reset()
 
     def _compose_snapshot(self) -> dict[str, Any]:
         if self.room is None:
@@ -937,10 +1131,13 @@ class AppController:
         if self.room is None:
             return
         snapshot = self._compose_snapshot()
-        signature = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        signature_snapshot = dict(snapshot)
+        signature_snapshot.pop("listening_ms", None)
+        signature = json.dumps(signature_snapshot, ensure_ascii=False, sort_keys=True)
         changed = signature != self._last_snapshot_signature
+        self.snapshot = snapshot
+        self._snapshot_received_at = time.monotonic()
         if changed or force:
-            self.snapshot = snapshot
             self._last_snapshot_signature = signature
             self._emit("snapshot", snapshot)
             if self.server is not None:
@@ -948,13 +1145,22 @@ class AppController:
                 self._last_broadcast_at = time.monotonic()
             self._snapshot_dirty = False
         elif self.server is not None and time.monotonic() - self._last_broadcast_at >= 5:
-            self.server.broadcast({"type": "snapshot", "snapshot": snapshot})
+            self.server.broadcast(
+                {
+                    "type": "heartbeat",
+                    "queue_revision": int(snapshot.get("queue_revision", 0)),
+                }
+            )
             self._last_broadcast_at = time.monotonic()
 
-    def _prune_cache(self) -> None:
+    def listening_time_ms(self) -> int:
+        base_ms = int(self.snapshot.get("listening_ms", 0))
+        playback = self.snapshot.get("playback", {})
+        if isinstance(playback, dict) and playback.get("playing"):
+            base_ms += int((time.monotonic() - self._snapshot_received_at) * 1_000)
+        return max(0, base_ms)
+    def _update_cache_pins(self) -> None:
         if self.cache is None:
-            return
-        if self._pending_downloads or self._pending_host_requests:
             return
         queue_items = self.snapshot.get("queue", [])
         current_index = int(self.snapshot.get("current_index", -1))
@@ -962,7 +1168,23 @@ class AppController:
         for index in (current_index - 1, current_index, current_index + 1):
             if 0 <= index < len(queue_items):
                 keep.add(str(queue_items[index]["track_id"]))
-        self.cache.prune(keep_track_ids=keep)
+        keep.update(
+            str(track_id)
+            for track_id in self.snapshot.get("history_track_ids", [])
+        )
+        if self.room is not None:
+            for track in (self.room.current_track, self.room.next_track):
+                if track is not None:
+                    keep.add(track.track_id)
+        keep.update(self._pending_downloads)
+        keep.update(self._pending_host_requests)
+        self.cache.set_pinned_track_ids(keep)
+
+    def _prune_cache(self) -> None:
+        if self.cache is None:
+            return
+        self._update_cache_pins()
+        self.cache.prune_to_limit()
 
     def _send_clock_ping(self) -> None:
         if self.role != "client" or self.client is None or not self.client.connected:
